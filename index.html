@@ -153,9 +153,17 @@
     </div>
   </main>
 
+<!-- Supabase JS 클라이언트 (UMD 빌드, 전역 supabase 객체 제공) -->
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
 <script>
 (() => {
-  const STORAGE_KEY = "shopping-list-items";
+  // Supabase 프로젝트 설정 (publishable key는 클라이언트 노출용 공개 키)
+  const SUPABASE_URL = "https://kgfjrgspfcrasfsybrtp.supabase.co";
+  const SUPABASE_KEY = "sb_publishable_VKj-ggDkW6NdWZrcauTxjw__4BuvHf7";
+  const TABLE = "shopping_items";
+  const LEGACY_STORAGE_KEY = "shopping-list-items"; // 예전 로컬 스토리지 키 (1회 마이그레이션용)
+
+  const db = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
   const form = document.getElementById("add-form");
   const input = document.getElementById("item-input");
@@ -164,55 +172,94 @@
   const summary = document.getElementById("summary");
   const clearDoneBtn = document.getElementById("clear-done");
 
-  let items = load();
+  let items = [];
 
-  function load() {
+  function showError(message, err) {
+    console.error(message, err);
+    summary.textContent = `⚠️ ${message}`;
+  }
+
+  // 예전 로컬 스토리지 데이터가 남아 있으면 DB로 옮긴 뒤 삭제
+  async function migrateLegacyItems() {
+    let legacy = [];
     try {
-      const raw = localStorage.getItem(STORAGE_KEY);
+      const raw = localStorage.getItem(LEGACY_STORAGE_KEY);
       const parsed = raw ? JSON.parse(raw) : [];
-      return Array.isArray(parsed) ? parsed : [];
-    } catch {
-      return [];
+      legacy = Array.isArray(parsed) ? parsed : [];
+    } catch { legacy = []; }
+    if (legacy.length === 0) return;
+
+    const rows = legacy
+      .filter(i => i && typeof i.name === "string" && i.name.trim())
+      .map(i => ({ name: i.name.trim().slice(0, 100), done: Boolean(i.done) }));
+
+    const { error } = rows.length ? await db.from(TABLE).insert(rows) : { error: null };
+    if (error) {
+      showError("기존 데이터를 옮기지 못했습니다", error);
+      return;
     }
+    try { localStorage.removeItem(LEGACY_STORAGE_KEY); } catch { /* 무시 */ }
   }
 
-  function save() {
-    try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(items));
-    } catch { /* 저장 실패는 무시 (시크릿 모드 등) */ }
-  }
-
-  // crypto.randomUUID(): 암호학적으로 안전한 v4 UUID (MDN 권장). 비보안 컨텍스트 대비 폴백 포함
-  function newId() {
-    return typeof crypto?.randomUUID === "function"
-      ? crypto.randomUUID()
-      : Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
-  }
-
-  function addItem(name) {
-    items.push({ id: newId(), name, done: false });
-    save();
+  async function load() {
+    summary.textContent = "불러오는 중…";
+    const { data, error } = await db
+      .from(TABLE)
+      .select("id, name, done, created_at")
+      .order("created_at", { ascending: true });
+    if (error) {
+      showError("목록을 불러오지 못했습니다", error);
+      return;
+    }
+    items = data ?? [];
     render();
   }
 
-  function toggleItem(id) {
+  async function addItem(name) {
+    const { data, error } = await db
+      .from(TABLE)
+      .insert({ name })
+      .select("id, name, done, created_at")
+      .single();
+    if (error) {
+      showError("추가에 실패했습니다", error);
+      return;
+    }
+    items.push(data);
+    render();
+  }
+
+  async function toggleItem(id) {
     const item = items.find(i => i.id === id);
-    if (item) {
-      item.done = !item.done;
-      save();
-      render();
+    if (!item) return;
+    const nextDone = !item.done;
+    const { error } = await db.from(TABLE).update({ done: nextDone }).eq("id", id);
+    if (error) {
+      showError("변경에 실패했습니다", error);
+      render(); // 체크박스 상태 원복
+      return;
     }
-  }
-
-  function deleteItem(id) {
-    items = items.filter(i => i.id !== id);
-    save();
+    item.done = nextDone;
     render();
   }
 
-  function clearDone() {
+  async function deleteItem(id) {
+    const { error } = await db.from(TABLE).delete().eq("id", id);
+    if (error) {
+      showError("삭제에 실패했습니다", error);
+      return;
+    }
+    items = items.filter(i => i.id !== id);
+    render();
+  }
+
+  async function clearDone() {
+    const { error } = await db.from(TABLE).delete().eq("done", true);
+    if (error) {
+      showError("삭제에 실패했습니다", error);
+      return;
+    }
     items = items.filter(i => !i.done);
-    save();
     render();
   }
 
@@ -258,19 +305,22 @@
     }
   }
 
-  form.addEventListener("submit", (e) => {
+  form.addEventListener("submit", async (e) => {
     e.preventDefault();
     const name = input.value.trim();
     if (!name) return;
-    addItem(name);
     input.value = "";
+    await addItem(name);
     input.focus();
   });
 
   clearDoneBtn.addEventListener("click", clearDone);
 
-  render();
-  input.focus();
+  (async () => {
+    await migrateLegacyItems();
+    await load();
+    input.focus();
+  })();
 })();
 </script>
 </body>
